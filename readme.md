@@ -1,6 +1,12 @@
 # Overview
 
-(A Trent Building indoor navigation and info query agent built upon the indoor-topo-navi repository)
+This is an AI agent for indoor navigation and information queries within the Trent Building. It leverages the indoor-topo-navi repository as its foundational navigation system to provide:
+
+Indoor wayfinding — Users can query directions to specific rooms, facilities, or points of interest within the Trent Building
+Information retrieval — The agent answers questions about building amenities, operating hours, event schedules, and other general queries
+Path planning — Integrates with the indoor topology navigation backend to compute optimal routes between locations
+
+
 
 # How to Run
 
