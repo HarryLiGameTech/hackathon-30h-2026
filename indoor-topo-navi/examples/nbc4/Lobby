@@ -1,0 +1,119 @@
+topo-sketchMap Lobby(){
+
+    // TODO: Separate UpperLobby and Lobby
+
+    let params: {permResident: Int} = {
+        //map_type = "TransHub",
+        permResident = 5 // 5 people always live here
+        // rushHour = {
+        //    timePeriod = 7:45~9:45,
+        //    gradient = EXPONENTIAL,
+        //    category = DEPART
+        // }, // In this period of time, people exponentially leaves this floor
+        // rushHour = {
+        //     timePeriod = 16:30~19:15,
+        //     gradient = LINEAR,
+        //     category = ARRIVE
+        // } // In this period of time, people linearly reaches this floor
+    }
+    
+    topo-node SW_corner
+    topo-node SE_corner
+
+    topo-node SouthExitOutside
+    topo-node SouthExitInside
+    topo-node WestExitOutside
+    topo-node WestExitInside
+    topo-node EastExitOutside
+    topo-node EastExitInside // == OS_hall_outside
+    topo-node hankyu_exit_outside
+    topo-node hankyu_exit_inside
+
+    topo-node OP1_hall
+    topo-node OP1_hall_outside
+    topo-node OP2_hall
+    topo-node OP2_hall_outside
+    topo-node OEX_hall_low
+    topo-node OEX_hall_upp
+    topo-node OEX_hall_upp_outside
+    topo-node OPS_hall
+    topo-node OPS_hall_1M
+    topo-node OS_hall
+
+    // topo-node escalator_low // == OP1_hall_outside
+    topo-node escalator_high // 1M escalator landing
+
+    topo-node staircase_A_1
+    topo-node staircase_A_1M
+    topo-node staircase_B
+    topo-node staircase_C
+    topo-node staircase_D
+    topo-node staircase_E
+    topo-node staircase_E_outside
+
+    topo-node west_intersact_1 // Near OPS and OEX
+    topo-node west_intersact_2 // Near entrance to ST-D
+    topo-node east_intersact_1 // Near entrance to ST-B
+
+    // Define Relationships 
+    // NTPP(toilet_hall, this) // Toilet hall is strictly inside this floor 
+    // TPP(male_toilet, toilet_hall) 
+    // TPP(female_toilet, toilet_hall) 
+    // EC(toilet_hall, staircase_1) // Toilets and staircase externally touches 
+    // DC(male_toilet, female_toilet) 
+    // DC(room_xx01, room_xx03) // These 2 rooms are on different side 
+    // DC(room_xx02, room_xx03) // These 2 rooms are on different side 
+    // EC(room_xx01, room_xx02) // Rooms next door 
+    // Rest to be discussed in later sections....
+
+
+    // Normal paths on the south
+    atomic-path [SouthExitOutside <-> SouthExitInside] {cost = 5} //requires InOpenTime
+
+    atomic-path [SW_corner <-> SouthExitInside] {cost = 8} //requires InOpenTime
+    atomic-path [SE_corner <-> SouthExitInside] {cost = 8} //requires InOpenTime
+    
+
+    // Normal paths on the west
+    atomic-path [WestExitOutside <-> WestExitInside] {cost = 5}
+    atomic-path [SW_corner <-> OP1_hall_outside] {cost = 5}
+    atomic-path [escalator_high <-> OP1_hall_outside] {cost = 15} // Take the escalator
+    atomic-path [west_intersact_1 <-> OPS_hall] {cost = 3}
+    atomic-path [west_intersact_1 <-> WestExitInside] {cost = 3}
+    atomic-path [OP1_hall_outside <-> WestExitInside] {cost = 3}
+    atomic-path [OP1_hall_outside <-> west_intersact_2] {cost = 3}
+
+    // Normal paths on the east
+    atomic-path [EastExitOutside <-> EastExitInside] {cost = 5}
+    atomic-path [EastExitOutside <-> OP2_hall_outside] {cost = 6}
+    atomic-path [SE_corner <-> OP2_hall_outside] {cost = 5}
+    atomic-path [EastExitInside <-> OP2_hall_outside] {cost = 5}
+    atomic-path [EastExitInside <-> east_intersact_1] {cost = 7}
+    atomic-path [hankyu_exit_inside <-> east_intersact_1] {cost = 4}
+    atomic-path [hankyu_exit_inside <-> hankyu_exit_outside] {cost = 3}
+    atomic-path [EastExitOutside <-> staircase_E_outside] {cost = 12}
+
+    // Strange stuff
+    atomic-path [OEX_hall_upp <-> staircase_A_1M] {cost = 8}
+    atomic-path [OS_hall <-> staircase_A_1] {cost = 5}
+
+
+    // Restricted paths
+    atomic-path [OP1_hall_outside <-> OP1_hall] {cost = 5} //requires TenantsOnly
+    atomic-path [OP2_hall_outside <-> OP2_hall] {cost = 5} //requires TenantsOnly
+    atomic-path [EastExitInside -> OPS_hall] {cost = 5} //requires TenantsOnly
+    atomic-path [OS_hall -> EastExitInside] {cost = 4} // Door opens outward, no restriction
+    atomic-path [OEX_hall_low <-> west_intersact_1] {cost = 5} //requires TenantsOnly
+    atomic-path [OEX_hall_upp <-> OEX_hall_upp_outside] {cost = 5} //requires TenantsOnly
+    atomic-path [west_intersact_2 <-> OEX_hall_upp_outside] {cost = 6} //requires TenantsOnly
+    atomic-path [west_intersact_2 -> staircase_D] {cost = 10} //requires TenantsOnly
+    atomic-path [east_intersact_1 -> staircase_B] {cost = 7} //requires TenantsOnly
+    atomic-path [staircase_B -> east_intersact_1] {cost = 5}
+    atomic-path [staircase_C -> SouthExitInside] {cost = 5}
+    atomic-path [SouthExitInside -> staircase_C] {cost = 6} //requires TenantsOnly
+    atomic-path [staircase_D -> west_intersact_2] {cost = 8}
+    atomic-path [staircase_E_outside -> staircase_E] {cost = 3} //requires TenantsOnly
+
+    // Passengers' elevator hall is on the RHS of the peh_crossing when heading to the north-west corner 
+    // Direction(passenger_elevator_hall, passenger_elevator_hall_crossing, NW_corner, RIGHT) 
+}

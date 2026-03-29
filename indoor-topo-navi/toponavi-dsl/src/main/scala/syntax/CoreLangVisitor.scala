@@ -1,0 +1,274 @@
+package syntax
+
+import corelang.*
+import topomap.grammar.MapFileParser.*
+import topomap.grammar.{MapFileBaseVisitor, MapFileParser}
+
+import scala.jdk.CollectionConverters.*
+
+class CoreLangVisitor[SurfaceTerm] extends MapFileBaseVisitor[
+  Expr | Type | SurfaceTerm |
+  Environment[Identifier, Type, Expr] 
+] {
+  
+  extension (expr: ExprContext) {
+    def visit: Expr = visitExpr(expr)
+  }
+
+  extension (id: IdentifierContext) {
+    def visit: Expr = visitIdentifier(id)
+  }
+
+  def visitExpr(expr: ExprContext): Expr = expr match {
+    case ctx: AtomExprContext     => visitAtomExpr(ctx)
+    case ctx: ProjExprContext     => visitProjExpr(ctx)
+    case ctx: AppMlExprContext    => visitAppMlExpr(ctx)
+    case ctx: AppCExprContext     => visitAppCExpr(ctx)
+    case ctx: NegExprContext      => visitNegExpr(ctx)
+    case ctx: MulDivExprContext   => visitMulDivExpr(ctx)
+    case ctx: AddSubExprContext   => visitAddSubExpr(ctx)
+    case ctx: CompExprContext     => visitCompExpr(ctx)
+    case ctx: IfExprContext       => visitIfExpr(ctx)
+    case ctx: LetExprContext      => visitLetExpr(ctx)
+    case ctx: LetRecExprContext   => visitLetRecExpr(ctx)
+    case ctx: FixExprContext      => visitFixExpr(ctx)
+    case ctx: LamExprContext      => visitLamExpr(ctx)
+    case _ => throw RuntimeException(s"Unknown ExprContext type: ${expr.getClass.getName}")
+  }
+
+
+  // --- Helpers for Currying ---
+  protected def curryLambda(params: Seq[(String, Type)], body: Expr): Expr = {
+    params.foldRight(body) { case ((name, tpe), acc) => Expr.Lam(name, tpe, acc) }
+  }
+
+  protected def curryApply(func: Expr, args: Seq[Expr]): Expr = {
+    args.foldLeft(func) { (acc, arg) => Expr.App(acc, arg) }
+  }
+
+  override def visitTypeDef(ctx: TypeDefContext): Environment[Identifier, Type, Expr] = {
+    Environment
+      .builder[Identifier, Type, Expr]
+      .typeVar(Identifier(ctx.ID().getText), visitTypeExpr(ctx.typeExpr))
+      .build()
+  }
+
+  override def visitFuncDef(ctx: FuncDefContext): Environment[Identifier, Type, Expr] = {
+    // def f(x: Int, y: Int): Int = body
+    // Becomes: ("f", Lam("x", Int, Lam("y", Int, body)))
+    // Note: Recursive definitions usually need LetRec, but at top-level 
+    // we just return the name and the value (the lambda chain).
+
+    val name = ctx.ID().getText
+    val bodyRaw = ctx.expr.visit
+
+    val params = if (ctx.paramList() == null) Seq.empty else {
+      ctx.paramList().param().asScala.map { p =>
+        (p.ID().getText, visitTypeExpr(p.typeExpr()))
+      }.toSeq
+    }
+
+    val bodyWithTypes = ctx.typeExpr() match {
+      // If return type is explicit, we might assume the body satisfies it. 
+      // In corelang, Lambda takes arg type, but return type is inferred.
+      // We do not wrap body in a type check node as Expr doesn't have one (only Fix does).
+      case null => bodyRaw
+      case _ => bodyRaw // Return type ignored in AST construction, handled by checker
+    }
+
+    Environment
+      .builder[Identifier, Type, Expr]
+      .valueVar(Identifier(name), curryLambda(params, bodyWithTypes))
+      .build()
+  }
+
+  override def visitLetDef(ctx: LetDefContext): Environment[Identifier, Type, Expr] = {
+    // let x: Int = 114514
+
+    val name = ctx.ID().getText
+    val bodyRaw = ctx.expr.visit
+
+    val bodyWithTypes = ctx.typeExpr() match {
+      // If return type is explicit, we might assume the body satisfies it.
+      // In corelang, Lambda takes arg type, but return type is inferred.
+      // We do not wrap body in a type check node as Expr doesn't have one (only Fix does).
+      case null => bodyRaw
+      case _ => bodyRaw // Return type ignored in AST construction, handled by checker
+    }
+
+    Environment
+      .builder[Identifier, Type, Expr]
+      .valueVar(Identifier(name), bodyWithTypes)
+      .build()
+  }
+
+  // --- Types ---
+  override def visitTypeExpr(ctx: TypeExprContext): Type = {
+    if (ctx.typeExpr() != null) {
+      // Int -> Int -> Int  =>  Arrow(Int, Arrow(Int, Int))
+      Type.Arrow(visitTypeAtom(ctx.typeAtom()), visitTypeExpr(ctx.typeExpr()))
+    } else {
+      visitTypeAtom(ctx.typeAtom())
+    }
+  }
+
+  override def visitTypeAtom(ctx: TypeAtomContext): Type = {
+    if (ctx.typeExpr() != null) {
+      // Case: '(' typeExpr ')'
+      visitTypeExpr(ctx.typeExpr())
+    }
+    else if (ctx.recordType() != null) {
+      // Case: recordType
+      visitRecordType(ctx.recordType())
+    }
+    else if (ctx.identifier() != null) {
+      // Case: ID (named types like aliases or enums)
+      val name = ctx.identifier().getText
+      // We throw here because corelang.Type requires resolved types, not just names
+      throw RuntimeException(s"Named types ($name) must be resolved or are not supported in this visitor yet.")
+    }
+    else {
+      // Case: 'Int' | 'Float' | 'Bool' | 'String'
+      // These are keywords, so they don't have helper methods like ID(),
+      // but we can check the text directly.
+      ctx.getText match {
+        case "Int"    => Type.IntType
+        case "Float"  => Type.FloatType
+        case "Bool"   => Type.BoolType
+        case "String" => Type.StringType
+        case other    => throw RuntimeException(s"Unknown type atom: $other")
+      }
+    }
+  }
+
+  override def visitRecordType(ctx: RecordTypeContext): Type = {
+    val fields = ctx.fieldDecl().asScala.map { field =>
+      (field.ID().getText, visitTypeExpr(field.typeExpr()))
+    }.toMap
+    Type.RecordType(fields)
+  }
+
+  // --- Expressions ---
+
+  override def visitAtomExpr(ctx: AtomExprContext): Expr = visitAtom(ctx.atom())
+
+  override def visitProjExpr(ctx: ProjExprContext): Expr = Expr.Proj(visitExpr(ctx.expr()), ctx.ID().getText)
+
+  override def visitAppMlExpr(ctx: AppMlExprContext): Expr =
+    Expr.App(visitExpr(ctx.expr()), visitAtom(ctx.atom()))
+
+  override def visitAppCExpr(ctx: AppCExprContext): Expr = {
+    val func = visitExpr(ctx.expr(0))
+    val args = if (ctx.expr().size() > 1) ctx.expr().asScala.tail.map(visitExpr).toSeq else Seq.empty
+    curryApply(func, args)
+  }
+
+  override def visitNegExpr(ctx: NegExprContext): Expr =
+    Expr.BinOp(OpKind.Neg, visitExpr(ctx.expr()), Expr.IntLit(0)) // RHS ignored; Neg is unary
+
+  override def visitMulDivExpr(ctx: MulDivExprContext): Expr = {
+    val op = ctx.op.getText match {
+      case "*" => OpKind.Mul
+      case "/" => throw new UnsupportedOperationException("Division not supported in OpKind yet")
+    }
+    Expr.BinOp(op, visitExpr(ctx.expr(0)), visitExpr(ctx.expr(1)))
+  }
+
+  override def visitAddSubExpr(ctx: AddSubExprContext): Expr = {
+    val op = ctx.op.getText match {
+      case "+" => OpKind.Add
+      case "-" => OpKind.Sub
+    }
+    Expr.BinOp(op, visitExpr(ctx.expr(0)), visitExpr(ctx.expr(1)))
+  }
+
+  override def visitCompExpr(ctx: CompExprContext): Expr = {
+    val op = ctx.op.getText match {
+      case "==" => OpKind.Eq
+      case "<"  => OpKind.Lt
+      case ">"  => OpKind.Gt
+      case "<=" => throw new UnsupportedOperationException("<= not supported in OpKind")
+      case ">=" => throw new UnsupportedOperationException(">= not supported in OpKind")
+    }
+    Expr.BinOp(op, visitExpr(ctx.expr(0)), visitExpr(ctx.expr(1)))
+  }
+
+  override def visitIfExpr(ctx: IfExprContext): Expr =
+    Expr.If(visitExpr(ctx.cond), visitExpr(ctx.ifExpr), visitExpr(ctx.elseExpr))
+
+  override def visitLetExpr(ctx: LetExprContext): Expr =
+    Expr.Let(ctx.ID().getText, visitExpr(ctx.assignValue), visitExpr(ctx.expr(1)))
+
+  override def visitLetRecExpr(ctx: LetRecExprContext): Expr = {
+    val name = ctx.ID().getText
+    val tpe = if (ctx.typeExpr() != null) visitTypeExpr(ctx.typeExpr()) else throw new RuntimeException("LetRec requires explicit type")
+    Expr.LetRec(name, tpe, visitExpr(ctx.expr(0)), visitExpr(ctx.expr(1)))
+  }
+
+  override def visitFixExpr(ctx: FixExprContext): Expr =
+    Expr.Fix(ctx.ID().getText, visitTypeExpr(ctx.typeExpr()), visitExpr(ctx.expr()))
+
+  override def visitLamExpr(ctx: LamExprContext): Expr = {
+    val name = ctx.ID().getText
+    val tpe = visitTypeExpr(ctx.typeExpr())
+    Expr.Lam(name, tpe, visitExpr(ctx.expr()))
+  }
+
+  // --- Atoms ---
+
+  override def visitAtom(ctx: AtomContext): Expr = {
+    if (ctx.INT() != null) Expr.IntLit(ctx.INT().getText.toLong)
+    else if (ctx.FLOAT() != null) Expr.FloatLit(ctx.FLOAT().getText.toDouble)
+    else if (ctx.STRING() != null) {
+      // Remove surrounding quotes
+      val str = ctx.STRING().getText
+      Expr.StringLit(str.substring(1, str.length - 1))
+    }
+    else if (ctx.getText == "true") Expr.BoolLit(true)
+    else if (ctx.getText == "false") Expr.BoolLit(false)
+    else if (ctx.identifier() != null) {
+      val ids = ctx.identifier().ID().asScala.map(_.getText).toList
+      if (ids.size == 1) Expr.Var(Identifier.Symbol(ids.head))
+      else Expr.Var(Identifier.Path(ids))
+    }
+    else if (ctx.block() != null) visitBlock(ctx.block())
+    else if (ctx.getChild(0).getText == "{") visitRecordLiteral(ctx)
+    else visitExpr(ctx.expr()) // Parentheses
+  }
+
+  protected def visitRecordLiteral(ctx: AtomContext): Expr = {
+    val fields = ctx.fieldAssign().asScala.map { field =>
+      (field.ID().getText, visitExpr(field.expr()))
+    }.toMap
+    Expr.Record(fields)
+  }
+
+  // --- Blocks ---
+
+  override def visitBlock(ctx: BlockContext): Expr = {
+    // { s1; s2; expr } -> Let(s1, Let(s2, expr))
+    // Note: corelang.Expr.Let takes (name, value, body). 
+    // This assumes statements are 'let x = ...'.
+    // If statement is just an expression (side effect), we treat it as Let("_", expr, body)
+
+    val stmts = ctx.stmt().asScala
+    val finalExpr = if (ctx.expr() != null) visitExpr(ctx.expr()) else Expr.Record(Map.empty) // Unit/Empty record if no final expr
+
+    stmts.foldRight(finalExpr) { (stmt, acc) =>
+      stmt match {
+        case s: LetStmtContext =>
+          // let x = e
+          Expr.Let(s.ID().getText, visitExpr(s.expr()), acc)
+        case s: ExprStmtContext =>
+          // e (side effect, discard result)
+          Expr.Let("_", visitExpr(s.expr()), acc)
+      }
+    }
+  }
+
+  override def visitIdentifier(ctx: IdentifierContext): Expr = {
+    val ids = ctx.path.asScala.map(_.getText).toList
+    if (ids.size == 1) Expr.Var(Identifier.Symbol(ids.head))
+    else Expr.Var(Identifier.Path(ids))
+  }
+}

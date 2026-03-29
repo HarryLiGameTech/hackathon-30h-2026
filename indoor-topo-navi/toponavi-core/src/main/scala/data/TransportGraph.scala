@@ -1,0 +1,342 @@
+package data
+
+import cats.effect.IO
+import enums.TransportServicePermission.{ArriveOnly, DepartOnly}
+import enums.VisitingMode.Normal
+import enums.{PathType, RoutePlanningPreferences, TransportServicePermission, VisitingMode}
+import enums.ElevatorTrafficPattern.UpRush
+import enums.ElevatorTrafficPattern.Flat
+import enums.RoutePlanningPreferences.{MinimizePhysicalDemands, MinimizeTime, MinimizeTransfers}
+
+import scala.collection.mutable
+
+// The RailNetwork shall be generated after all the modifiers are applied. i.e. locked and ineligible floor/elevator pair shall not appear here
+class TransportGraph private(
+  val nodes: List[StationNode],
+  val adjacencyList: Map[StationNode, Map[StationNode, Double]]
+) extends Serializable {
+  def findPath(
+    start: StationNode,
+    goal: StationNode,
+    floorNameList: List[String]
+  ): Option[TransportationPath] = {
+    // Priority queue for open set (min-heap based on fScore)
+    implicit val nodeOrdering: Ordering[(StationNode, Double)] =
+      Ordering.by[(StationNode, Double), Double](_._2).reverse
+
+    val openSet = mutable.PriorityQueue.empty[(StationNode, Double)]
+    val gScore = mutable.Map[StationNode, Double]().withDefaultValue(Double.PositiveInfinity)
+    val fScore = mutable.Map[StationNode, Double]().withDefaultValue(Double.PositiveInfinity)
+    val cameFrom = mutable.Map[StationNode, StationNode]()
+
+    var bestPath: Option[TransportationPath] = None
+    var bestCost = Double.PositiveInfinity
+
+    // Initialize starting node
+    gScore(start) = 0.0
+    fScore(start) = heuristic(start, goal, floorNameList)
+    openSet.enqueue((start, fScore(start)))
+
+    while (openSet.nonEmpty) {
+      val (current, currentFScore) = openSet.dequeue()
+
+      // If we reached the goal, reconstruct the path
+      if (current == goal) {
+        return Some(reconstructPath(cameFrom, current))
+      }
+
+      // If the current fScore is outdated, skip
+      if (currentFScore > fScore(current)) {
+        // This can happen because priority queue doesn't support decrease-key
+        // So we allow duplicate nodes with different scores
+        ()
+      } else {
+        // If we reached the goal, record it but don't return yet
+        if (current == goal) {
+          val pathCost = gScore(current)
+          if (pathCost < bestCost) {
+            bestCost = pathCost
+            bestPath = Some(reconstructPath(cameFrom, current))
+          }
+          // Continue searching - there might be a better path we haven't found yet
+        }
+
+        // Only explore neighbors if current path might lead to a better solution
+        if (gScore(current) < bestCost) {
+          for ((neighbor, edgeCost) <- adjacencyList.getOrElse(current, Map.empty)) {
+            val tentativeGScore = gScore(current) + edgeCost
+
+            if (tentativeGScore < gScore(neighbor)) {
+              cameFrom(neighbor) = current
+              gScore(neighbor) = tentativeGScore
+              fScore(neighbor) = tentativeGScore + heuristic(neighbor, goal, floorNameList)
+
+              // Only enqueue if this path might be better than our current best
+              if (fScore(neighbor) < bestCost) {
+                openSet.enqueue((neighbor, fScore(neighbor)))
+              }
+            }
+          }
+        }
+      }
+    }
+
+    //
+    bestPath
+  }
+
+
+  // This one only provide cross-graph fuzzy pathfinding without considering the start and goal nodes inside each graph
+  // Outputs the returnIndex-th quickest cross-graph traveling solution (0 means quickest and n means slowest)
+  def findPathFuzzy(
+    startGraph: NavigationGraph,
+    goalGraph: NavigationGraph,
+    floorNameList: List[String],
+    preference: RoutePlanningPreferences,
+    returnIndex: Int
+  ): Option[TransportationPath] = {
+    val startNodes = nodes.filter(_.ownerGraph == startGraph)
+    val goalNodes = nodes.filter(_.ownerGraph == goalGraph)
+
+    val allPaths = mutable.ListBuffer[TransportationPath]()
+    for (startNode <- startNodes) {
+      for (goalNode <- goalNodes) {
+        val pathOption = findPath(startNode, goalNode, floorNameList)
+        pathOption match {
+          case Some(path) => allPaths += path
+          case None => ()
+        }
+      }
+    }
+    val sortedPaths = preference match {
+      case MinimizeTime => allPaths.sortBy(_.totalCost)
+      case MinimizeTransfers => allPaths.sortBy(p => (p.routeEdges.size, p.totalCost)) // Fallback to total cost when transfer counts are equal
+      case MinimizePhysicalDemands => allPaths.sortBy(_.physicalDemandScore)
+      case _ => allPaths.sortBy(_.totalCost)
+    }
+
+    if (returnIndex >= 0 && returnIndex < sortedPaths.size) {
+      Some(TransportationPath(sortedPaths(returnIndex).routeNodes, sortedPaths(returnIndex).routeEdges))
+    }
+    else {
+      None
+    }
+  }
+
+
+  // Why did I wrote this exactly??
+//  def findPathFuzzy(
+//    startGraph: NavigationGraph,
+//    goal: StationNode,
+//    floorNameList: List[String],
+//    preference: RoutePlanningPreferences,
+//    returnIndex: Int
+//  ): TransportationPath = {
+//    val startNodes = nodes.filter(_.ownerGraph == startGraph)
+//    // TODO: Try findPath for all possible combinations
+//    TransportationPath(List.empty, List.empty)
+//  }
+
+
+  private def heuristic(from: StationNode, to: StationNode, stationNameList: List[String]): Double = {
+    // Get the floor identifiers
+    val fromFloor = from.ownerGraph.identifier
+    val toFloor = to.ownerGraph.identifier
+
+    // Find the indices in the station name list
+    val fromIndex = stationNameList.indexOf(fromFloor)
+    val toIndex = stationNameList.indexOf(toFloor)
+
+    // If either floor is not found in the list, return a large penalty
+    if (fromIndex == -1 || toIndex == -1) {
+      return Double.PositiveInfinity
+    }
+
+    // Calculate the absolute index difference and multiply by 2.5
+    // TODO: Enhance heuristic value, this is too NAIVE
+    val indexDifference = math.abs(fromIndex - toIndex)
+    0.01 * indexDifference
+  }
+
+  private def actualCostBetween(from: StationNode, to: StationNode): Double = {
+    if (from.ownerLine == to.ownerLine){
+      // Use the line's travel time
+      from.ownerLine.travelTimeBetweenStations(from.ownerGraph, to.ownerGraph, UpRush)
+    }
+    else{
+      // Use the transfer time via the navigation graph
+      from.ownerGraph.findPath(
+        from.ownerLine.stationNodes(from.ownerGraph),
+        to.ownerLine.stationNodes(to.ownerGraph),
+        VisitingMode.Normal
+      ) match{
+        case Some(path) =>
+          path.totalCost(VisitingMode.Normal)
+        case None =>
+          Double.PositiveInfinity // No valid transfer path
+      }
+    }
+  }
+
+  // TODO: Option[TransportationPath]
+  private def reconstructPath(cameFrom: mutable.Map[StationNode, StationNode], current: StationNode): TransportationPath = {
+    val totalPath = mutable.ListBuffer[StationNode]()
+    val pathEdges = mutable.ListBuffer[TransportEdge]()
+    var node = current
+
+    while (cameFrom.contains(node)) {
+      val parent = cameFrom(node)
+
+      totalPath.prepend(node)
+
+      if (parent.ownerLine == node.ownerLine){
+        pathEdges.prepend(TransportEdge(parent, node, parent.ownerLine.travelTimeBetweenStations(parent.ownerGraph, node.ownerGraph, UpRush)))
+      }
+      else{
+        val transferCost: Double = parent.ownerGraph.findPath(
+          parent.ownerLine.stationNodes(parent.ownerGraph),
+          node.ownerLine.stationNodes(node.ownerGraph),
+          VisitingMode.Normal
+        ).getOrElse(throw RuntimeException("Interchange: Path not found")).totalCost(VisitingMode.Normal)
+        pathEdges.prepend(TransportEdge(parent, node, transferCost))
+      }
+
+      node = parent  // Move to the next node
+    }
+    totalPath.prepend(node)
+
+    TransportationPath(totalPath.toList, pathEdges.toList)
+  }
+  
+}
+
+def trim(stationNodeId: String): String = {
+  // Assuming the format is "LineID@GraphID", we split by "@" and take the first part
+  stationNodeId.split("@").headOption.getOrElse(stationNodeId)
+}
+
+
+object TransportGraph {
+  // Factory method to create TransportGraph
+  def apply(
+    lines: List[LinearTransport]
+  ): TransportGraph = {
+    val (nodes, edges) = generateTransGraphEdges(lines)
+    val adjacencyList = buildAdjacencyList(edges)
+    new TransportGraph(nodes, adjacencyList)
+  }
+
+  private def generateTransGraphEdges(lines: List[LinearTransport]): (List[StationNode], Set[TransportEdge]) = {
+    val edges = mutable.ListBuffer[TransportEdge]()
+    val allNodes = mutable.ListBuffer[StationNode]()
+
+    // Iterate over each line
+    for (line: LinearTransport <- lines: List[LinearTransport]) {
+      // Get all station nodes for this line
+      val stationNodes = createStationNodesForLine(line)
+      allNodes ++= stationNodes
+
+      // Create TWO types of edges:
+      // 1. Internal edges: Within each elevator line (complete graph)
+      for (line <- lines) {
+        val stationNodes = allNodes.filter(_.ownerLine == line) // Get nodes for this specific line
+
+        for {
+          from <- stationNodes
+          to <- stationNodes
+          if ((from != to && from.permission != ArriveOnly) && to.permission != DepartOnly) // Avoid self-loops and takes permission into account
+        } {
+          val cost = line.travelTimeBetweenStations(from.ownerGraph, to.ownerGraph, UpRush)
+          edges += TransportEdge(from, to, cost)
+        }
+      }
+
+      // 2. Transfer edges: Between different elevator lines serving the same floor
+      // Group nodes by the NavigationGraph they serve (same physical floor)
+      val nodesByFloor = allNodes.groupBy(_.ownerGraph)
+
+      for {
+        (navigationGraph, nodesOnSameFloor) <- nodesByFloor
+        if nodesOnSameFloor.size > 1 // Only floors with multiple elevators
+      } {
+        // Create edges between every pair of different elevator lines on this floor
+        for {
+          from <- nodesOnSameFloor
+          to <- nodesOnSameFloor
+          if from != to && from.ownerLine != to.ownerLine // Different elevator lines
+        } {
+          // Calculate the transfer-time according to the intra-map navigation
+          from.ownerGraph.findPath(
+            from.ownerLine.stationNodes(from.ownerGraph),
+            to.ownerLine.stationNodes(to.ownerGraph),
+            VisitingMode.Normal
+          ) match{
+            case Some(path) =>
+              val transferCost = path.totalCost(VisitingMode.Normal)
+              edges += TransportEdge(from, to, transferCost)
+            case None => () // Just skip this non-existent edge when path-not-found on NavigationGraph
+          }
+        }
+      }
+    }
+    (allNodes.toList, edges.toSet)
+  }
+
+  private def createStationNodesForLine(line: LinearTransport): List[StationNode] = {
+    line.stationNodes.map {
+      case (navigationGraph, topoNode) =>
+        StationNode (
+          identifier = s"${line.identifier}@${navigationGraph.identifier}",
+
+          ownerGraph = navigationGraph,
+
+          ownerLine = line,
+
+          permission = // Determine permission based on arrival/departure capabilities
+            (line.canArriveAt(navigationGraph), line.canDepartFrom(navigationGraph)) match {
+              case (true, true) => TransportServicePermission.FullyGranted
+              case (true, false) => TransportServicePermission.ArriveOnly
+              case (false, true) => TransportServicePermission.DepartOnly
+              case (false, false) => TransportServicePermission.NoAccess
+            }
+        )
+    }
+  }.toList
+}
+
+  private def buildAdjacencyList(edges: Set[TransportEdge]): Map[StationNode, Map[StationNode, Double]] = {
+    edges
+      .groupBy(_.source) // Group all edges by their source node
+      .view
+      .mapValues(_.map(e => e.target -> e.cost).toMap) // Preserve precomputed costs
+      .toMap
+  }
+
+// This one might have fucked up
+case class StationNode(
+  identifier: String,
+  ownerGraph: NavigationGraph,
+  ownerLine: LinearTransport,
+  permission: TransportServicePermission
+){
+//  def localNode: TopoNode = ownerGraph.nodes.find(n => n.identifier == trim(identifier)).getOrElse(throw RuntimeException(s"StationNode: Local node for ${identifier} not found"))
+  def localNode: TopoNode = ownerLine.stationNodes(ownerGraph)
+
+  override def toString: String = identifier
+
+  override def equals(obj: Any): Boolean = obj match {
+    case other: StationNode => this.identifier == other.identifier
+    case _ => false
+  }
+
+  override def hashCode(): Int = identifier.hashCode
+}
+
+case class TransportEdge(
+  source: StationNode,
+  target: StationNode,
+  cost: Double
+)
+
+
+
